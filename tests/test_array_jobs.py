@@ -12,9 +12,9 @@ TestWorkflows. They cover:
 
 import asyncio
 import base64
-import errno
 import json
 import re
+import zlib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -109,6 +109,10 @@ def _make_executor_stub(array_jobs=None, array_limit=100):
             pass_command_as_script=False,
         ),
         workdir_init=Path("/tmp"),
+        # get_python_executable reads this to decide between sys.executable and
+        # a bare "python". run_array_jobs needs it now that the batch script
+        # names the interpreter that decodes the per task payload.
+        storage_settings=SimpleNamespace(shared_fs_usage=set()),
     )
 
     executor._job_submission_executor = MagicMock()
@@ -376,31 +380,22 @@ class TestRunArrayJobs:
         external_ids = [c[0][0].external_jobid for c in calls]
         assert external_ids == ["987654_1", "987654_2", "987654_3"]
 
-    def test_array_execs_task_1_absent_tasks_2_plus_present(
+    def test_array_execs_covers_every_task_of_the_chunk(
         self, tmp_path, mock_popen_success
     ):
-        """The --slurm-jobstep-array-execs map has keys 2,3,… but never 1.
+        """The payload has a key per array task, the first one included.
 
-        Task 1 executes via the plain base exec_job; tasks 2+ are encoded
-        in the compressed map so the job-step can dispatch them.
+        The batch script looks its own $SLURM_ARRAY_TASK_ID up in this map, so
+        a task missing from it has no command to run.
         """
         executor = self._build_executor(tmp_path)
         jobs = self._make_jobs(n=3)
         executor.run_array_jobs(jobs)
-        popen_call_str = mock_popen_success.call_args_list[0][0][0]
-        match = re.search(
-            r"--slurm-jobstep-array-execs=(?:'([A-Za-z0-9+/=]+)'|([A-Za-z0-9+/=]+))",
-            popen_call_str,
-        )
-        assert match, (
-            "Could not find --slurm-jobstep-array-execs in sbatch call.\n"
-            f"Call was: {popen_call_str!r}"
-        )
-        encoded_payload = match.group(1) or match.group(2)
-        array_execs = json.loads(base64.b64decode(encoded_payload).decode("utf-8"))
-        assert "1" not in array_execs
-        assert "2" in array_execs
-        assert "3" in array_execs
+        script = mock_popen_success.return_value.communicate.call_args.kwargs["input"]
+        match = re.search(r"([A-Za-z0-9+/=]{16,})\)", script)
+        assert match, f"no payload in the batch script:\n{script}"
+        array_execs = json.loads(base64.b64decode(match.group(1)).decode("utf-8"))
+        assert set(array_execs) == {"1", "2", "3"}
 
     def test_memory_fudge_can_be_disabled(self, tmp_path, mock_popen_success):
         executor = self._build_executor(tmp_path)
@@ -424,8 +419,8 @@ class TestRunArrayJobs:
         popen_call_str = mock_popen_success.call_args_list[0][0][0]
         assert "--mem 1" in popen_call_str
 
-    def test_array_execs_omits_first_task_of_each_chunk(self, tmp_path):
-        """For each chunk, first task uses base exec command and is absent from map."""
+    def test_array_execs_covers_every_task_of_each_chunk(self, tmp_path):
+        """Each chunk's payload covers exactly that chunk's tasks."""
         executor = self._build_executor(tmp_path, array_limit=3)
         jobs = self._make_jobs(n=5)
 
@@ -436,32 +431,15 @@ class TestRunArrayJobs:
             mock_popen.return_value = proc
             executor.run_array_jobs(jobs)
 
-        first_call_str = mock_popen.call_args_list[0][0][0]
-        second_call_str = mock_popen.call_args_list[1][0][0]
+        maps = []
+        for call in proc.communicate.call_args_list:
+            script = call.kwargs["input"]
+            match = re.search(r"([A-Za-z0-9+/=]{16,})\)", script)
+            assert match, f"no payload in the batch script:\n{script}"
+            maps.append(json.loads(base64.b64decode(match.group(1)).decode("utf-8")))
 
-        assert '--wrap="snakemake_exec_1 ' in first_call_str
-        assert '--wrap="snakemake_exec_4 ' in second_call_str
-
-        first_match = re.search(
-            r"--slurm-jobstep-array-execs=(?:'([A-Za-z0-9+/=]+)'|([A-Za-z0-9+/=]+))",
-            first_call_str,
-        )
-        second_match = re.search(
-            r"--slurm-jobstep-array-execs=(?:'([A-Za-z0-9+/=]+)'|([A-Za-z0-9+/=]+))",
-            second_call_str,
-        )
-        assert first_match and second_match
-
-        first_payload = first_match.group(1) or first_match.group(2)
-        second_payload = second_match.group(1) or second_match.group(2)
-        first_map = json.loads(base64.b64decode(first_payload).decode("utf-8"))
-        second_map = json.loads(base64.b64decode(second_payload).decode("utf-8"))
-
-        assert "1" not in first_map
-        assert "2" in first_map
-        assert "3" in first_map
-        assert "4" not in second_map
-        assert "5" in second_map
+        assert set(maps[0]) == {"1", "2", "3"}
+        assert set(maps[1]) == {"4", "5"}
 
     def test_array_limit_produces_chunked_sbatch_calls(self, tmp_path):
         """5 jobs with array_limit=3 → 2 Popen calls: --array=1-3 and --array=4-5."""
@@ -481,8 +459,38 @@ class TestRunArrayJobs:
         assert "--array=1-3" in first_call_str
         assert "--array=4-5" in second_call_str
 
-    def test_e2big_retries_with_stdin_script_mode(self, tmp_path):
-        """If --wrap exceeds argv size, retry once via /dev/stdin script mode."""
+    def test_each_task_gets_its_own_command(self, tmp_path):
+        """Decoding the payload for task k yields job k's command.
+
+        Before this, every task ran the chunk's first job's command as its
+        wrapper and only the nested job step was swapped, so the wrapper
+        postprocessed the first job in every task.
+        """
+        executor = self._build_executor(tmp_path)
+        jobs = self._make_jobs(n=4)
+
+        with patch("snakemake_executor_plugin_slurm.subprocess.Popen") as mock_popen:
+            proc = MagicMock()
+            proc.communicate.return_value = ("444444", "")
+            proc.returncode = 0
+            mock_popen.return_value = proc
+            executor.run_array_jobs(jobs)
+
+        script = proc.communicate.call_args.kwargs["input"]
+        match = re.search(r"([A-Za-z0-9+/=]{16,})\)", script)
+        assert match, f"no payload in the batch script:\n{script}"
+        array_execs = json.loads(base64.b64decode(match.group(1)).decode("utf-8"))
+
+        for index in range(1, 5):
+            command = zlib.decompress(bytes.fromhex(array_execs[str(index)])).decode()
+            assert command == f"snakemake_exec_{index}"
+
+    def test_submission_is_always_a_stdin_script(self, tmp_path):
+        """The payload goes in the batch script, never in the sbatch argv.
+
+        That is what removed the E2BIG retry: an argument list too long for
+        --wrap was the only reason to fall back to script mode.
+        """
         executor = self._build_executor(tmp_path)
         jobs = self._make_jobs(n=3)
 
@@ -490,19 +498,17 @@ class TestRunArrayJobs:
             proc = MagicMock()
             proc.communicate.return_value = ("222222", "")
             proc.returncode = 0
-            mock_popen.side_effect = [
-                OSError(errno.E2BIG, "Argument list too long"),
-                proc,
-            ]
-
+            mock_popen.return_value = proc
             executor.run_array_jobs(jobs)
 
-        assert mock_popen.call_count == 2
-        first_call_str = mock_popen.call_args_list[0][0][0]
-        second_call_str = mock_popen.call_args_list[1][0][0]
-        assert "--wrap=" in first_call_str
-        assert "/dev/stdin" in second_call_str
-        assert proc.communicate.call_args.kwargs["input"].startswith("#!/bin/sh")
+        assert mock_popen.call_count == 1
+        call_str = mock_popen.call_args_list[0][0][0]
+        assert "/dev/stdin" in call_str
+        assert "--wrap=" not in call_str
+        assert "--slurm-jobstep-array-execs" not in call_str
+        script = proc.communicate.call_args.kwargs["input"]
+        assert script.startswith("#!/bin/sh")
+        assert "SLURM_ARRAY_TASK_ID" in script
 
     def test_non_empty_wildcards_in_comment_triggers_warning(
         self, tmp_path, mock_popen_success

@@ -909,12 +909,9 @@ class Executor(RemoteExecutor):
             array_limit = min(self.max_array_size, len(jobs))
             for start_index in range(1, len(jobs) + 1, array_limit):
                 end_index = min(start_index + array_limit - 1, len(jobs))
-                # The first task of each chunk runs via the plain base command.
-                # Remaining tasks are dispatched from --slurm-jobstep-array-execs.
-                exec_job = self.format_job_exec(jobs[start_index - 1])
+                # Every task of the chunk, so each can look up its own command.
                 sub_array_execs = {
-                    str(i): array_execs[i]
-                    for i in range(start_index + 1, end_index + 1)
+                    str(i): array_execs[i] for i in range(start_index, end_index + 1)
                 }
                 array_execs_payload = base64.b64encode(
                     json.dumps(sub_array_execs).encode("utf-8")
@@ -933,28 +930,16 @@ class Executor(RemoteExecutor):
                 while True:
                     call_with_array = call + f" --array={start_index}-{end_index}"
 
-                    if not use_script_submission:
-                        # Use --wrap for the base execution command.
-                        call_with_array += (
-                            f' --wrap="{exec_job}'
-                            f" --slurm-jobstep-array-execs="
-                            f"{shlex.quote(array_execs_payload)}"
-                            '"'
-                        )
-                        subprocess_stdin = None
-                        self.logger.debug(f"call with array: {call_with_array}")
-                    else:
-                        # Use /dev/stdin to pass the base execution command as a script.
-                        sbatch_script = "\n".join(
-                            [
-                                "#!/bin/sh",
-                                f"{exec_job}",
-                                "--slurm-jobstep-array-execs",
-                                shlex.quote(array_execs_payload),
-                            ]
-                        )
-                        call_with_array += " /dev/stdin"
-                        subprocess_stdin = sbatch_script
+                    # patched: per task array dispatch
+                    # The batch script picks the command for its own task, so
+                    # no snakemake process in the task carries another job's
+                    # target. use_script_submission no longer decides anything
+                    # here; the payload never reaches the command line.
+                    subprocess_stdin = _array_dispatch_script(
+                        self.get_python_executable(), array_execs_payload
+                    )
+                    call_with_array += " /dev/stdin"
+                    self.logger.debug(f"call with array: {call_with_array}")
 
                     self.logger.debug(
                         f"Submitting array job with sbatch call: {call_with_array}"
@@ -1729,3 +1714,31 @@ We leave it to SLURM to resume your job(s)""")
             return f" -p {shlex.quote(str(partition))}"
         else:
             return ""
+
+
+# patched: per task array dispatch
+def _array_dispatch_script(python_executable: str, payload: str) -> str:
+    """Batch script running the command that belongs to this array task.
+
+    The payload is the mapping the plugin already builds: array task id to a
+    zlib compressed, hex encoded snakemake command. Decoding it in the batch
+    script rather than one snakemake process deeper is the only change.
+    """
+    decoder = (
+        "import base64, json, os, sys, zlib\n"
+        "mapping = json.loads(base64.b64decode(sys.argv[1]))\n"
+        "task = os.environ['SLURM_ARRAY_TASK_ID']\n"
+        "sys.stdout.write(zlib.decompress(bytes.fromhex(mapping[task])).decode())\n"
+    )
+    lookup = (
+        f"{shlex.quote(python_executable)} -c {shlex.quote(decoder)} "
+        f"{shlex.quote(payload)}"
+    )
+    return "\n".join(
+        [
+            "#!/bin/sh",
+            "set -e",
+            f"snakemake_call=$({lookup})",
+            'eval "$snakemake_call"',
+        ]
+    )
