@@ -350,7 +350,9 @@ Using `--slurm-array-jobs` SLURM job arrays can be submitted. `--slurm-array-job
 
 Note: group jobs cannot be array jobs.
 
-.. note:: Using array jobs does impose a synchronization overhead (all jobs of a particular rule need to be ready for execution).
+.. note:: Each dispatch submits the jobs of a rule that are ready at that moment. A rule whose jobs become ready a few at a time, because a resource limits how many run at once, is submitted as several small arrays rather than one large one.
+
+One array submission carries one set of sbatch options. Jobs of a rule whose options differ, a retry with scaled memory for instance, are grouped separately and submitted as their own array or as single jobs.
 
 When submitting array jobs, the `--slurm-array-limit` flag defines the
 maximum number of array tasks to be submitted in one job submission.
