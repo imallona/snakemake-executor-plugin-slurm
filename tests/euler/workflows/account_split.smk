@@ -22,7 +22,7 @@ rule work:
         "done/account_split/{i}.txt",
     resources:
         runtime=5,
-        mem_mb=500,
+        mem_mb_per_cpu=500,
         slurm_account=account_for,
     shell:
         probe_call("account_split_{wildcards.i}") + "; touch {output}"

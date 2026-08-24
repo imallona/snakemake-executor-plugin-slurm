@@ -26,6 +26,7 @@ shift
 export PYTHONPATH="$repo_root${PYTHONPATH:+:$PYTHONPATH}"
 export EULER_PROBE="$euler_dir/probe.sh"
 export EULER_SLEEP="${EULER_SLEEP:-5}"
+: "${EULER_PARTITION:=${EULER_PARTITION_A:-}}"
 
 resolved="$(python -c \
     'import snakemake_executor_plugin_slurm as m; print(m.__file__)')"
@@ -111,9 +112,18 @@ for scenario in "${scenarios[@]}"; do
     mkdir -p "$probe_dir" "$log_dir"
     export EULER_PROBE_DIR="$probe_dir"
 
-    default_resources=()
+    # Without a default the cluster picks its own partition, which on Euler is
+    # ultramem. Rules that route per wildcard override this.
+    defaults=()
     if [ -n "${EULER_ACCOUNT:-}" ]; then
-        default_resources=(--default-resources "slurm_account=$EULER_ACCOUNT")
+        defaults+=("slurm_account=$EULER_ACCOUNT")
+    fi
+    if [ -n "${EULER_PARTITION:-}" ]; then
+        defaults+=("slurm_partition=$EULER_PARTITION")
+    fi
+    default_resources=()
+    if [ ${#defaults[@]} -gt 0 ]; then
+        default_resources=(--default-resources "${defaults[@]}")
     fi
 
     echo "== $scenario"
@@ -123,6 +133,7 @@ for scenario in "${scenarios[@]}"; do
         --directory "$run_dir" \
         --executor slurm \
         --slurm-logdir "$log_dir" \
+        --slurm-keep-successful-logs \
         --latency-wait 60 \
         "${default_resources[@]+"${default_resources[@]}"}" \
         ${scenario_args[$scenario]} \

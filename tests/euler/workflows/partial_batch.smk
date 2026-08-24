@@ -16,6 +16,6 @@ rule work:
         "done/partial_batch/{i}.txt",
     resources:
         runtime=5,
-        mem_mb=500,
+        mem_mb_per_cpu=500,
     shell:
         probe_call("partial_batch_{wildcards.i}") + "; touch {output}"

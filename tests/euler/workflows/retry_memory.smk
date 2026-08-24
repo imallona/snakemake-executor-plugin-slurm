@@ -17,7 +17,7 @@ rule work:
         "done/retry_memory/{i}.txt",
     resources:
         runtime=5,
-        mem_mb=lambda wildcards, attempt: 500 * attempt,
+        mem_mb_per_cpu=lambda wildcards, attempt: 500 * attempt,
     params:
         flag=lambda wildcards: f"{FLAG_DIR}/{wildcards.i}",
         fails=lambda wildcards: int(wildcards.i) == 0,

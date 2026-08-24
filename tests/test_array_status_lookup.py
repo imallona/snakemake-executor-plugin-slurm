@@ -153,3 +153,20 @@ def test_parent_fallback_completed_keeps_array_task_log(monkeypatch, tmp_path):
     assert remaining == []
     executor.report_job_success.assert_called_once()
     executor.report_job_error.assert_not_called()
+
+
+def test_sacct_query_asks_for_job_id_not_raw():
+    """Array tasks must be identifiable in the sacct output.
+
+    JobIdRaw gives an array task a number of its own that never matches the
+    '<array>_<task>' id the executor tracks, and the raw id of one task is the
+    array id itself, so the parent fallback resolved every task to that one
+    task's state.
+    """
+    from snakemake_executor_plugin_slurm.job_status_query import (
+        query_job_status_sacct,
+    )
+
+    command = query_job_status_sacct("some-run-uuid")
+    assert "--format=JobID,State" in command
+    assert "JobIdRaw" not in command

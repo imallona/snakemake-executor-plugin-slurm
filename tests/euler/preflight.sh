@@ -12,8 +12,11 @@ echo "repo checkout: $repo_root"
 echo
 
 echo "--- plugin resolution ---"
-echo "without PYTHONPATH (what your environment normally uses):"
-python -c 'import snakemake_executor_plugin_slurm as m; print("  ", m.__file__)' \
+# Probed from / because python puts the working directory on sys.path, which
+# from the checkout would report the checkout whether or not it is installed.
+echo "installed copy (what your environment normally uses):"
+(cd / && python -c \
+    'import snakemake_executor_plugin_slurm as m; print("  ", m.__file__)') \
     2>/dev/null || echo "   not importable"
 
 echo "with PYTHONPATH=$repo_root (what run_checks.sh uses):"

@@ -16,6 +16,6 @@ rule work:
         "done/array_chunking/{i}.txt",
     resources:
         runtime=5,
-        mem_mb=500,
+        mem_mb_per_cpu=500,
     shell:
         probe_call("array_chunking_{wildcards.i}") + "; touch {output}"

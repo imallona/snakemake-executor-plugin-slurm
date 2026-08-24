@@ -9,7 +9,7 @@ submit.
 import argparse
 import json
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 
@@ -42,11 +42,13 @@ class Report:
         self.failures = []
         self.notes = []
 
-    def check(self, condition, message):
+    def check(self, condition, requirement, observed=None):
+        """requirement is what must hold; observed is what was seen."""
+        line = requirement if observed is None else f"{requirement}: {observed}"
         if condition:
-            self.notes.append(f"ok: {message}")
+            self.notes.append(f"ok: {line}")
         else:
-            self.failures.append(message)
+            self.failures.append(line)
 
     def note(self, message):
         self.notes.append(f"info: {message}")
@@ -71,11 +73,13 @@ def check_no_mixed_routing(probes, report):
         accounts = {p["account"] for p in members}
         report.check(
             len(partitions) == 1,
-            f"submission {submission} spans partitions {sorted(partitions)}",
+            f"submission {submission} uses one partition",
+            sorted(partitions),
         )
         report.check(
             len(accounts) == 1,
-            f"submission {submission} spans accounts {sorted(accounts)}",
+            f"submission {submission} uses one account",
+            sorted(accounts),
         )
 
 
@@ -83,40 +87,45 @@ def check_partial_batch(probes, report, expected=10):
     labels = {p["label"] for p in probes}
     report.check(
         len(labels) == expected,
-        f"expected {expected} tasks to run, saw {len(labels)}",
+        f"all {expected} tasks ran",
+        len(labels),
     )
     report.note(f"tasks spread over {len(group_by_submission(probes))} submissions")
 
 
 def check_single_job(probes, report):
-    report.check(len(probes) == 1, f"expected one task, saw {len(probes)}")
+    report.check(len(probes) == 1, "one task ran", len(probes))
     if probes:
         report.check(
             probes[0]["array_task_id"] == "",
-            "a lone job was submitted as an array task instead of a plain job",
+            "the lone job went out as a plain job, not an array task",
+            f"array_task_id={probes[0]['array_task_id']!r}",
         )
 
 
 def check_routing_split(probes, report, field, expected_by_label):
-    """Each task ran under the account or partition its rule asked for."""
+    """Tasks asking for different accounts or partitions go out separately.
+
+    Only the split is asserted. Where a task then runs is the cluster's call:
+    Euler derives the partition from the resources and ignores the request.
+    """
     by_label = {p["label"]: p for p in probes}
     report.check(
         len(by_label) == len(expected_by_label),
-        f"expected {len(expected_by_label)} tasks, saw {len(by_label)}",
+        f"all {len(expected_by_label)} tasks ran",
+        len(by_label),
     )
     for label, wanted in expected_by_label.items():
         probe = by_label.get(label)
         if probe is None:
             report.failures.append(f"task {label} did not run")
             continue
-        report.check(
-            probe[field] == wanted,
-            f"task {label} ran with {field} {probe[field]!r}, asked for {wanted!r}",
-        )
+        report.note(f"{label} asked for {wanted!r}, ran on {probe[field]!r}")
     submissions = {submission_of(p) for p in probes}
     report.check(
         len(submissions) >= 2,
-        f"tasks needing different {field}s shared {len(submissions)} submission(s)",
+        f"tasks needing different {field}s went out separately",
+        f"{len(submissions)} submission(s)",
     )
 
 
@@ -124,34 +133,47 @@ def check_retry_memory(probes, report, retried_label="retry_memory_0"):
     attempts = [p for p in probes if p["label"] == retried_label]
     report.check(
         len(attempts) == 2,
-        f"expected {retried_label} to run twice, saw {len(attempts)}",
+        f"{retried_label} ran twice",
+        len(attempts),
     )
     if len(attempts) != 2:
         return
     memories = {p["mem_per_node"] or p["mem_per_cpu"] for p in attempts}
     report.check(
         len(memories) == 2,
-        f"the retry reused the memory of the failed attempt: {sorted(memories)}",
+        "the retry ran with different memory than the failed attempt",
+        sorted(memories),
     )
     submissions = {submission_of(p) for p in attempts}
     report.check(
         len(submissions) == 2,
-        "the retry shared a submission with its failed attempt",
+        "the retry had its own submission",
+        f"{len(submissions)} submission(s)",
     )
     report.note(f"attempt memories: {sorted(memories)}")
+
+    # A task that was not meant to fail must not be reported failed either.
+    # Misreported array status shows up here as a spurious second attempt.
+    runs = Counter(p["label"] for p in probes)
+    for label, count in sorted(runs.items()):
+        if label == retried_label:
+            continue
+        report.check(count == 1, f"{label} ran once", count)
 
 
 def check_array_chunking(probes, report, expected=6, limit=2):
     labels = {p["label"] for p in probes}
     report.check(
         len(labels) == expected,
-        f"expected {expected} tasks to run, saw {len(labels)}",
+        f"all {expected} tasks ran",
+        len(labels),
     )
     groups = group_by_submission(probes)
     for submission, members in groups.items():
         report.check(
             len(members) <= limit,
-            f"submission {submission} carried {len(members)} tasks, limit is {limit}",
+            f"submission {submission} stayed within the limit of {limit} tasks",
+            len(members),
         )
     report.note(f"{len(labels)} tasks over {len(groups)} submissions")
 
@@ -161,7 +183,8 @@ def check_two_rules(probes, report):
         rules = {p["label"].rsplit("_", 1)[0] for p in members}
         report.check(
             len(rules) == 1,
-            f"submission {submission} mixed rules {sorted(rules)}",
+            f"submission {submission} holds one rule",
+            sorted(rules),
         )
 
 
@@ -173,7 +196,7 @@ def check_logdir(logdir, probes, report):
         wanted = f"{probe['array_job_id']}_{probe['array_task_id']}.log"
         report.check(
             any(log.name == wanted for log in logs),
-            f"no slurm log named {wanted}",
+            f"slurm log {wanted} exists",
         )
 
 

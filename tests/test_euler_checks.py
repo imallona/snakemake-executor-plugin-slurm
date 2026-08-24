@@ -130,8 +130,8 @@ class TestMixedRoutingDetection:
 
 
 class TestRoutingSplitScenario:
-    def test_tasks_routed_to_the_wrong_partition_fail(self):
-        """Every task landing on the first task's partition is the failure."""
+    def test_one_submission_for_two_partitions_fails(self):
+        """One array for both partitions is the failure, however it ran."""
         probes = [
             _probe(
                 f"partition_split_{i}",
@@ -146,9 +146,7 @@ class TestRoutingSplitScenario:
         }
         report = checker.Report("partition_split")
         checker.check_routing_split(probes, report, "partition", wanted)
-        assert report.failures
-        assert any("asked for 'gpu'" in f for f in report.failures)
-        assert any("shared 1 submission" in f for f in report.failures)
+        assert any("went out separately: 1 submission(s)" in f for f in report.failures)
 
     def test_tasks_routed_as_asked_pass(self):
         probes = [
@@ -224,7 +222,7 @@ class TestRetryMemoryScenario:
         ]
         report = checker.Report("retry_memory")
         checker.check_retry_memory(probes, report)
-        assert any("reused the memory" in f for f in report.failures)
+        assert any("different memory" in f for f in report.failures)
 
     def test_a_retry_sharing_its_submission_fails(self):
         probes = [
@@ -238,16 +236,29 @@ class TestRetryMemoryScenario:
         ]
         report = checker.Report("retry_memory")
         checker.check_retry_memory(probes, report)
-        assert any("shared a submission" in f for f in report.failures)
+        assert any("its own submission" in f for f in report.failures)
 
     def test_a_retry_with_scaled_memory_passes(self):
         probes = [
             _probe("retry_memory_0", array_job_id="100", array_task_id="0"),
             _probe("retry_memory_0", job_id="102", mem_per_node="1000"),
+            _probe("retry_memory_1", array_job_id="100", array_task_id="1"),
         ]
         report = checker.Report("retry_memory")
         checker.check_retry_memory(probes, report)
         assert not report.failures
+
+    def test_a_sibling_retried_without_failing_fails(self):
+        """Misreported array status shows up as a spurious second attempt."""
+        probes = [
+            _probe("retry_memory_0", array_job_id="100", array_task_id="0"),
+            _probe("retry_memory_0", job_id="102", mem_per_node="1000"),
+            _probe("retry_memory_1", array_job_id="100", array_task_id="1"),
+            _probe("retry_memory_1", job_id="103", mem_per_node="1000"),
+        ]
+        report = checker.Report("retry_memory")
+        checker.check_retry_memory(probes, report)
+        assert any("retry_memory_1 ran once: 2" in f for f in report.failures)
 
     def test_a_job_that_never_retried_fails(self):
         probes = [_probe("retry_memory_0", array_job_id="100", array_task_id="0")]
@@ -264,7 +275,7 @@ class TestArrayChunkingScenario:
         ]
         report = checker.Report("array_chunking")
         checker.check_array_chunking(probes, report, expected=6, limit=2)
-        assert any("limit is 2" in f for f in report.failures)
+        assert any("limit of 2 tasks" in f for f in report.failures)
 
     def test_chunks_at_the_limit_pass(self):
         probes = [
@@ -305,7 +316,7 @@ class TestLogdirCheck:
         probes = [_probe("t0", array_job_id="100", array_task_id="0")]
         report = checker.Report("partial_batch")
         checker.check_logdir(tmp_path, probes, report)
-        assert any("no slurm log named 100_0.log" in f for f in report.failures)
+        assert any("slurm log 100_0.log exists" in f for f in report.failures)
 
     def test_a_log_per_task_passes(self, tmp_path):
         rule_dir = tmp_path / "rule_work"

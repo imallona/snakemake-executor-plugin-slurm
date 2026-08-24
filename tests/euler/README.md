@@ -13,14 +13,17 @@ Run `preflight.sh` first and read the plugin path it prints.
 ```
 ./tests/euler/preflight.sh
 
-export EULER_PARTITION_A=<a partition you may use>
-export EULER_PARTITION_B=<a different one>
-export EULER_ACCOUNT=<the account to charge>        # optional
+export EULER_PARTITION_A=normal.4h
+export EULER_PARTITION_B=normal.24h
+export EULER_ACCOUNT=<the account to charge>
+export EULER_PARTITION=normal.4h                    # optional, defaults to _A
 export EULER_ACCOUNT_A=<one account>                # optional
 export EULER_ACCOUNT_B=<a different one>            # optional
 
 ./tests/euler/run_checks.sh /cluster/scratch/$USER/slurm_plugin_checks
 ```
+
+`EULER_PARTITION` is where the scenarios that do not route per wildcard send their jobs. Without it Euler picks its own default, `ultramem.bulk`, which is a poor place for a five second job.
 
 Pass scenario names to run a subset:
 
@@ -43,6 +46,8 @@ Pass scenario names to run a subset:
 | `two_rules` | two array rules ready together | each rule gets its own submission |
 
 One invariant is checked in every scenario: no single sbatch call may carry tasks with differing account or partition.
+
+The workflows request `mem_mb_per_cpu`, not `mem_mb`. Euler's submit filter rejects `--mem`: `Requesting memory by node is not supported. Use --mem-per-cpu.`
 
 ## Assertions
 

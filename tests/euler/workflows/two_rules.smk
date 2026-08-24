@@ -17,7 +17,7 @@ rule alpha:
         "done/two_rules/alpha_{i}.txt",
     resources:
         runtime=5,
-        mem_mb=500,
+        mem_mb_per_cpu=500,
     shell:
         probe_call("two_rules_alpha_{wildcards.i}") + "; touch {output}"
 
@@ -27,6 +27,6 @@ rule beta:
         "done/two_rules/beta_{i}.txt",
     resources:
         runtime=5,
-        mem_mb=500,
+        mem_mb_per_cpu=500,
     shell:
         probe_call("two_rules_beta_{wildcards.i}") + "; touch {output}"

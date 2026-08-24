@@ -22,7 +22,7 @@ rule work:
         "done/partition_split/{i}.txt",
     resources:
         runtime=5,
-        mem_mb=500,
+        mem_mb_per_cpu=500,
         slurm_partition=partition_for,
     shell:
         probe_call("partition_split_{wildcards.i}") + "; touch {output}"

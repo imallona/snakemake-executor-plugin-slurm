@@ -14,6 +14,6 @@ rule work:
         "done/single_job/only.txt",
     resources:
         runtime=5,
-        mem_mb=500,
+        mem_mb_per_cpu=500,
     shell:
         probe_call("single_job_only") + "; touch {output}"
