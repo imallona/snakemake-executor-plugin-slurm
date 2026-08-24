@@ -321,6 +321,103 @@ class TestRunJobsRouting:
         assert len(single_call) == 1
         assert single_call[0][0][1] == retry
 
+    def test_array_rule_splits_jobs_bound_for_different_partitions(self):
+        """One array carries the partition of its first task, so tasks
+        asking for different partitions go out separately.
+        """
+        executor = _make_executor_stub(array_jobs="myrule", array_limit=10)
+        cpu_jobs = [
+            _make_mock_job(rule_name="myrule", jobid=i, slurm_partition="cpu")
+            for i in (1, 2)
+        ]
+        gpu_jobs = [
+            _make_mock_job(rule_name="myrule", jobid=i, slurm_partition="gpu")
+            for i in (3, 4)
+        ]
+
+        executor.run_jobs(cpu_jobs + gpu_jobs)
+
+        calls = executor._job_submission_executor.submit.call_args_list
+        assert len(calls) == 2
+        assert all(c[0][0] == executor.run_array_jobs for c in calls)
+        submitted = [c[0][1] for c in calls]
+        assert cpu_jobs in submitted
+        assert gpu_jobs in submitted
+
+    def test_array_rule_splits_jobs_bound_for_different_accounts(self):
+        """Tasks billed to different accounts do not share a submission."""
+        executor = _make_executor_stub(array_jobs="myrule", array_limit=10)
+        first_account = [
+            _make_mock_job(rule_name="myrule", jobid=i, slurm_account="acct_a")
+            for i in (1, 2)
+        ]
+        second_account = [
+            _make_mock_job(rule_name="myrule", jobid=i, slurm_account="acct_b")
+            for i in (3, 4)
+        ]
+
+        executor.run_jobs(first_account + second_account)
+
+        calls = executor._job_submission_executor.submit.call_args_list
+        assert len(calls) == 2
+        submitted = [c[0][1] for c in calls]
+        assert first_account in submitted
+        assert second_account in submitted
+
+    def test_array_rule_keeps_matching_routing_in_one_submission(self):
+        """Equal account and partition requests share one array."""
+        executor = _make_executor_stub(array_jobs="myrule", array_limit=10)
+        jobs = [
+            _make_mock_job(
+                rule_name="myrule",
+                jobid=i,
+                slurm_account="acct_a",
+                slurm_partition="cpu",
+            )
+            for i in (1, 2, 3)
+        ]
+
+        executor.run_jobs(jobs)
+
+        calls = executor._job_submission_executor.submit.call_args_list
+        assert len(calls) == 1
+        assert calls[0][0][0] == executor.run_array_jobs
+        assert calls[0][0][1] == jobs
+
+    def test_a_numeric_account_groups_with_its_string_spelling(self):
+        """YAML may hand over an account as int; both spell the same account."""
+        executor = _make_executor_stub(array_jobs="myrule", array_limit=10)
+        jobs = [
+            _make_mock_job(rule_name="myrule", jobid=1, slurm_account=123456),
+            _make_mock_job(rule_name="myrule", jobid=2, slurm_account="123456"),
+        ]
+
+        executor.run_jobs(jobs)
+
+        calls = executor._job_submission_executor.submit.call_args_list
+        assert len(calls) == 1
+        assert calls[0][0][1] == jobs
+
+    def test_grouping_does_not_resolve_accounts_or_partitions(self):
+        """Grouping reads the requested resources, it does not resolve them.
+
+        Resolving validates the account against the cluster and may run
+        partition auto-selection, too slow to repeat for every job on every
+        dispatch.
+        """
+        executor = _make_executor_stub(array_jobs="myrule", array_limit=10)
+        executor.get_account_arg = MagicMock()
+        executor.get_partition_arg = MagicMock()
+        jobs = [
+            _make_mock_job(rule_name="myrule", jobid=i, slurm_partition="cpu")
+            for i in (1, 2)
+        ]
+
+        executor.run_jobs(jobs)
+
+        executor.get_account_arg.assert_not_called()
+        executor.get_partition_arg.assert_not_called()
+
     def test_array_rule_submits_a_full_chunk(self):
         """A batch at chunk size goes out as one array submission."""
         executor = _make_executor_stub(array_jobs="myrule", array_limit=10)

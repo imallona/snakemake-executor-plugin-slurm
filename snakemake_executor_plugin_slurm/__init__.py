@@ -449,6 +449,7 @@ def _select_logdir(workflow):
 
 # Placeholders for the parts of an sbatch call that say which job it is rather
 # than what it asks for. Held constant so a signature compares resources only.
+# _submission_signature compares account and partition separately.
 _SIGNATURE_PARAMS = {
     "run_uuid": "",
     "slurm_logfile": "",
@@ -713,10 +714,9 @@ class Executor(RemoteExecutor):
             self.logger.debug(f"Current array job settings: {self.array_jobs}")
 
             if array_selected_for_rule:
-                # The scheduler counts every job it hands over as running
-                # and never offers it again, so a job held back to fill a
-                # larger array is never submitted and the workflow waits on it
-                # forever. Submit whatever arrived, however few.
+                # The scheduler counts a job as running once it hands it
+                # over and never offers it again, so a job held back to fill
+                # a larger array is never submitted. Submit whatever arrived.
                 if len(same_rule_jobs) == 1:
                     self.logger.debug(
                         f"Array submission requested for rule {rule_name}, "
@@ -748,27 +748,38 @@ class Executor(RemoteExecutor):
                 for job in same_rule_jobs:
                     self._submit_job(job)
 
-    def _submission_signature(self, job: JobExecutorInterface) -> str:
-        """The sbatch options this job needs, as a string.
+    def _submission_signature(self, job: JobExecutorInterface) -> tuple:
+        """The sbatch options this job needs, as a hashable key.
 
-        One array submission carries one set of options, taken from its
-        first task, so only jobs whose options match may share it. A retry is
-        the case that matters: an attempt with scaled memory would otherwise
-        be submitted with the memory it already failed on.
+        One array submission carries the options of its first task, so only
+        jobs whose options match may share it.
+
+        Account and partition enter as the requested resources, not as
+        resolved sbatch arguments: resolving validates the account against the
+        cluster and may run partition auto-selection, too slow to repeat for
+        every job on every dispatch. Resolution is deterministic given the
+        request and the rest of the resources, which the command already
+        covers.
         """
+        account = job.resources.get("slurm_account")
+        partition = job.resources.get("slurm_partition")
+        routing = (
+            str(account) if account is not None else None,
+            str(partition) if partition is not None else None,
+        )
         try:
-            return get_submit_command(
+            command = get_submit_command(
                 job,
                 dict(_SIGNATURE_PARAMS),
                 settings=self.workflow.executor_settings,
                 failed_nodes=self._failed_nodes,
             ) + set_gres_string(job)
         except Exception as e:
-            # Grouping by rule alone is what this plugin did before the
-            # signature existed, so a job that cannot be rendered is no worse
-            # off for falling back to it.
+            # A job whose command cannot be rendered groups by rule and
+            # routing alone.
             self.logger.debug(f"Cannot build a submission signature: {e}")
-            return ""
+            command = ""
+        return (command,) + routing
 
     def _submit_job(self, job: JobExecutorInterface):
         """Emit standard job metadata before submitting one Slurm job."""
