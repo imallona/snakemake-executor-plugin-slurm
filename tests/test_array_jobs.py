@@ -418,6 +418,70 @@ class TestRunJobsRouting:
         executor.get_account_arg.assert_not_called()
         executor.get_partition_arg.assert_not_called()
 
+    def test_a_non_array_rule_builds_no_submission_signature(self):
+        """Only an array submission shares options, so only it needs one.
+
+        Rendering a signature per job on every dispatch is wasted work when
+        the jobs go out one by one anyway.
+        """
+        executor = _make_executor_stub(array_jobs=None)
+        executor._submission_signature = MagicMock()
+        jobs = [_make_mock_job(rule_name="myrule", jobid=i) for i in (1, 2, 3)]
+
+        executor.run_jobs(jobs)
+
+        executor._submission_signature.assert_not_called()
+        assert len(executor._job_submission_executor.submit.call_args_list) == 3
+
+    def test_an_array_rule_still_builds_a_submission_signature(self):
+        """The rules that need the signature keep getting one."""
+        executor = _make_executor_stub(array_jobs="myrule", array_limit=10)
+        real_signature = executor._submission_signature
+        executor._submission_signature = MagicMock(side_effect=real_signature)
+        jobs = [_make_mock_job(rule_name="myrule", jobid=i) for i in (1, 2)]
+
+        executor.run_jobs(jobs)
+
+        assert executor._submission_signature.call_count == 2
+
+    def test_array_rule_splits_jobs_auto_selection_would_route_apart(self):
+        """Resources that steer partition auto-selection must split a batch.
+
+        mpi_tasks never reaches the sbatch call and tasks_per_node reaches it
+        only for MPI jobs, yet partition scoring reads both. Two such jobs
+        render the same command, so grouping on the command alone would put
+        them in one array under the first job's partition.
+        """
+        for resource in ("mpi_tasks", "tasks_per_node"):
+            executor = _make_executor_stub(array_jobs="myrule", array_limit=10)
+            jobs = [
+                _make_mock_job(rule_name="myrule", jobid=1, **{resource: 2}),
+                _make_mock_job(rule_name="myrule", jobid=2, **{resource: 64}),
+            ]
+
+            executor.run_jobs(jobs)
+
+            calls = executor._job_submission_executor.submit.call_args_list
+            assert len(calls) == 2, f"{resource} did not split the batch"
+            assert all(call[0][0] == executor.run_job for call in calls)
+
+    def test_array_rule_keeps_jobs_with_equal_routing_resources_together(self):
+        """Splitting stays limited to jobs that actually differ."""
+        executor = _make_executor_stub(array_jobs="myrule", array_limit=10)
+        jobs = [
+            _make_mock_job(
+                rule_name="myrule", jobid=i, mpi_tasks=4, tasks_per_node=2, mem_mb=1000
+            )
+            for i in (1, 2, 3)
+        ]
+
+        executor.run_jobs(jobs)
+
+        calls = executor._job_submission_executor.submit.call_args_list
+        assert len(calls) == 1
+        assert calls[0][0][0] == executor.run_array_jobs
+        assert calls[0][0][1] == jobs
+
     def test_array_rule_submits_a_full_chunk(self):
         """A batch at chunk size goes out as one array submission."""
         executor = _make_executor_stub(array_jobs="myrule", array_limit=10)

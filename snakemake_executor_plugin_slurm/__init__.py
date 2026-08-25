@@ -450,6 +450,32 @@ def _select_logdir(workflow):
 # Placeholders for the parts of an sbatch call that say which job it is rather
 # than what it asks for. Held constant so a signature compares resources only.
 # _submission_signature compares account and partition separately.
+# Resources that steer which account and partition a job resolves to.
+# The rendered command covers most of them, but not all: `mpi_tasks` never
+# reaches the sbatch call, and `tasks_per_node` reaches it only for MPI jobs,
+# while partition auto-selection scores a job on both. Reading them here
+# instead of trusting the command keeps the signature honest. Splitting on a
+# resource that turns out not to matter costs a smaller array; missing one
+# submits a task under another job's account or partition.
+_ROUTING_RESOURCES = (
+    "slurm_account",
+    "slurm_partition",
+    "slurm_cluster",
+    "cluster",
+    "clusters",
+    "mem_mb",
+    "mem_mb_per_cpu",
+    "runtime",
+    "nodes",
+    "tasks",
+    "tasks_per_node",
+    "mpi_tasks",
+    "mpi",
+    "gpu",
+    "gpu_model",
+    "gres",
+)
+
 _SIGNATURE_PARAMS = {
     "run_uuid": "",
     "slurm_logfile": "",
@@ -702,13 +728,19 @@ class Executor(RemoteExecutor):
                     )
                 self._submit_job(job)
             else:
-                key = (job.rule.name, self._submission_signature(job))
+                rule_name = job.rule.name
+                # Only an array submission makes its tasks share one set of
+                # sbatch options, so only it needs the signature that keeps
+                # mismatched jobs out of the same submission. Rendering one
+                # per job on every dispatch is wasted work otherwise.
+                if self._array_selected(rule_name):
+                    key = (rule_name, self._submission_signature(job))
+                else:
+                    key = (rule_name, None)
                 ready_jobs_by_rule.setdefault(key, []).append(job)
 
         for (rule_name, _signature), same_rule_jobs in ready_jobs_by_rule.items():
-            array_selected_for_rule = (
-                "all" in self.array_jobs or rule_name in self.array_jobs
-            )
+            array_selected_for_rule = self._array_selected(rule_name)
             # TODO: use more sensible logging information, once finished
             self.logger.debug(f"Running jobs for rule: {rule_name}, {same_rule_jobs}")
             self.logger.debug(f"Current array job settings: {self.array_jobs}")
@@ -748,6 +780,10 @@ class Executor(RemoteExecutor):
                 for job in same_rule_jobs:
                     self._submit_job(job)
 
+    def _array_selected(self, rule_name: str) -> bool:
+        """Whether jobs of this rule are to be submitted as an array."""
+        return "all" in self.array_jobs or rule_name in self.array_jobs
+
     def _submission_signature(self, job: JobExecutorInterface) -> tuple:
         """The sbatch options this job needs, as a hashable key.
 
@@ -758,14 +794,13 @@ class Executor(RemoteExecutor):
         resolved sbatch arguments: resolving validates the account against the
         cluster and may run partition auto-selection, too slow to repeat for
         every job on every dispatch. Resolution is deterministic given the
-        request and the rest of the resources, which the command already
-        covers.
+        request and the resources that auto-selection scores, so the signature
+        reads those directly rather than trusting the command to show them
+        all - see _ROUTING_RESOURCES.
         """
-        account = job.resources.get("slurm_account")
-        partition = job.resources.get("slurm_partition")
-        routing = (
-            str(account) if account is not None else None,
-            str(partition) if partition is not None else None,
+        routing = tuple(
+            None if value is None else str(value)
+            for value in (job.resources.get(key) for key in _ROUTING_RESOURCES)
         )
         try:
             command = get_submit_command(
