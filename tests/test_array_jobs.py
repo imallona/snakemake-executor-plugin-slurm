@@ -261,10 +261,12 @@ class TestRunJobsRouting:
         assert executor.run_job in methods
         assert executor.run_array_jobs in methods
 
-    def test_array_rule_waits_below_chunk_if_more_eligible_in_dag(self):
+    def test_array_rule_submits_a_partial_batch(self):
         """
-        With DAG showing more pending jobs, do not submit until chunk
-        size is reached.
+        Fewer ready jobs than the DAG has pending, and fewer than one chunk,
+        still go out. Held back they would never be submitted at all: the
+        scheduler counts every job it hands over as running and never offers
+        it again.
         """
         executor = _make_executor_stub(array_jobs="myrule", array_limit=10)
         ready_jobs = [_make_mock_job(rule_name="myrule", jobid=i) for i in range(1, 6)]
@@ -275,15 +277,213 @@ class TestRunJobsRouting:
 
         executor.run_jobs(ready_jobs)
 
-        assert executor._job_submission_executor.submit.call_count == 0
-        for job in ready_jobs:
-            job.log_info.assert_not_called()
+        calls = executor._job_submission_executor.submit.call_args_list
+        assert len(calls) == 1
+        assert calls[0][0][0] == executor.run_array_jobs
+        assert calls[0][0][1] == ready_jobs
 
-    def test_array_rule_submits_at_chunk_size_even_if_more_eligible_in_dag(self):
+    def test_array_rule_single_ready_job_submits_while_others_pend(self):
+        """One ready job of many pending is submitted, not held for an array."""
+        executor = _make_executor_stub(array_jobs="myrule", array_limit=10)
+        ready_job = _make_mock_job(rule_name="myrule", jobid=1)
+        pending_jobs = [
+            _make_mock_job(rule_name="myrule", jobid=i) for i in range(1, 101)
+        ]
+        executor.workflow.dag = SimpleNamespace(needrun_jobs=lambda: pending_jobs)
+
+        executor.run_jobs([ready_job])
+
+        calls = executor._job_submission_executor.submit.call_args_list
+        assert len(calls) == 1
+        assert calls[0][0][0] == executor.run_job
+        ready_job.log_info.assert_called_once()
+
+    def test_array_rule_splits_jobs_that_need_different_sbatch_options(self):
+        """A retry with more memory is submitted apart from the first attempts.
+
+        One array submission carries the options of its first task, so mixing
+        them would run the retry with the memory it already died on.
         """
-        With DAG showing more pending jobs, submit once at least one full
-        chunk is ready.
+        executor = _make_executor_stub(array_jobs="myrule", array_limit=10)
+        first_attempt = [
+            _make_mock_job(rule_name="myrule", jobid=i, mem_mb=1000) for i in (1, 2)
+        ]
+        retry = _make_mock_job(rule_name="myrule", jobid=3, mem_mb=4000)
+
+        executor.run_jobs(first_attempt + [retry])
+
+        calls = executor._job_submission_executor.submit.call_args_list
+        assert len(calls) == 2
+        array_call = [c for c in calls if c[0][0] == executor.run_array_jobs]
+        single_call = [c for c in calls if c[0][0] == executor.run_job]
+        assert len(array_call) == 1
+        assert array_call[0][0][1] == first_attempt
+        assert len(single_call) == 1
+        assert single_call[0][0][1] == retry
+
+    def test_array_rule_splits_jobs_bound_for_different_partitions(self):
+        """One array carries the partition of its first task, so tasks
+        asking for different partitions go out separately.
         """
+        executor = _make_executor_stub(array_jobs="myrule", array_limit=10)
+        cpu_jobs = [
+            _make_mock_job(rule_name="myrule", jobid=i, slurm_partition="cpu")
+            for i in (1, 2)
+        ]
+        gpu_jobs = [
+            _make_mock_job(rule_name="myrule", jobid=i, slurm_partition="gpu")
+            for i in (3, 4)
+        ]
+
+        executor.run_jobs(cpu_jobs + gpu_jobs)
+
+        calls = executor._job_submission_executor.submit.call_args_list
+        assert len(calls) == 2
+        assert all(c[0][0] == executor.run_array_jobs for c in calls)
+        submitted = [c[0][1] for c in calls]
+        assert cpu_jobs in submitted
+        assert gpu_jobs in submitted
+
+    def test_array_rule_splits_jobs_bound_for_different_accounts(self):
+        """Tasks billed to different accounts do not share a submission."""
+        executor = _make_executor_stub(array_jobs="myrule", array_limit=10)
+        first_account = [
+            _make_mock_job(rule_name="myrule", jobid=i, slurm_account="acct_a")
+            for i in (1, 2)
+        ]
+        second_account = [
+            _make_mock_job(rule_name="myrule", jobid=i, slurm_account="acct_b")
+            for i in (3, 4)
+        ]
+
+        executor.run_jobs(first_account + second_account)
+
+        calls = executor._job_submission_executor.submit.call_args_list
+        assert len(calls) == 2
+        submitted = [c[0][1] for c in calls]
+        assert first_account in submitted
+        assert second_account in submitted
+
+    def test_array_rule_keeps_matching_routing_in_one_submission(self):
+        """Equal account and partition requests share one array."""
+        executor = _make_executor_stub(array_jobs="myrule", array_limit=10)
+        jobs = [
+            _make_mock_job(
+                rule_name="myrule",
+                jobid=i,
+                slurm_account="acct_a",
+                slurm_partition="cpu",
+            )
+            for i in (1, 2, 3)
+        ]
+
+        executor.run_jobs(jobs)
+
+        calls = executor._job_submission_executor.submit.call_args_list
+        assert len(calls) == 1
+        assert calls[0][0][0] == executor.run_array_jobs
+        assert calls[0][0][1] == jobs
+
+    def test_a_numeric_account_groups_with_its_string_spelling(self):
+        """YAML may hand over an account as int; both spell the same account."""
+        executor = _make_executor_stub(array_jobs="myrule", array_limit=10)
+        jobs = [
+            _make_mock_job(rule_name="myrule", jobid=1, slurm_account=123456),
+            _make_mock_job(rule_name="myrule", jobid=2, slurm_account="123456"),
+        ]
+
+        executor.run_jobs(jobs)
+
+        calls = executor._job_submission_executor.submit.call_args_list
+        assert len(calls) == 1
+        assert calls[0][0][1] == jobs
+
+    def test_grouping_does_not_resolve_accounts_or_partitions(self):
+        """Grouping reads the requested resources, it does not resolve them.
+
+        Resolving validates the account against the cluster and may run
+        partition auto-selection, too slow to repeat for every job on every
+        dispatch.
+        """
+        executor = _make_executor_stub(array_jobs="myrule", array_limit=10)
+        executor.get_account_arg = MagicMock()
+        executor.get_partition_arg = MagicMock()
+        jobs = [
+            _make_mock_job(rule_name="myrule", jobid=i, slurm_partition="cpu")
+            for i in (1, 2)
+        ]
+
+        executor.run_jobs(jobs)
+
+        executor.get_account_arg.assert_not_called()
+        executor.get_partition_arg.assert_not_called()
+
+    def test_a_non_array_rule_builds_no_submission_signature(self):
+        """Only an array submission shares options, so only it needs one.
+
+        Rendering a signature per job on every dispatch is wasted work when
+        the jobs go out one by one anyway.
+        """
+        executor = _make_executor_stub(array_jobs=None)
+        executor._submission_signature = MagicMock()
+        jobs = [_make_mock_job(rule_name="myrule", jobid=i) for i in (1, 2, 3)]
+
+        executor.run_jobs(jobs)
+
+        executor._submission_signature.assert_not_called()
+        assert len(executor._job_submission_executor.submit.call_args_list) == 3
+
+    def test_an_array_rule_still_builds_a_submission_signature(self):
+        """The rules that need the signature keep getting one."""
+        executor = _make_executor_stub(array_jobs="myrule", array_limit=10)
+        real_signature = executor._submission_signature
+        executor._submission_signature = MagicMock(side_effect=real_signature)
+        jobs = [_make_mock_job(rule_name="myrule", jobid=i) for i in (1, 2)]
+
+        executor.run_jobs(jobs)
+
+        assert executor._submission_signature.call_count == 2
+
+    def test_array_rule_splits_jobs_auto_selection_would_route_apart(self):
+        """Resources that steer partition auto-selection must split a batch.
+
+        mpi_tasks never reaches the sbatch call and tasks_per_node reaches it
+        only for MPI jobs, yet partition scoring reads both. Two such jobs
+        render the same command, so grouping on the command alone would put
+        them in one array under the first job's partition.
+        """
+        for resource in ("mpi_tasks", "tasks_per_node"):
+            executor = _make_executor_stub(array_jobs="myrule", array_limit=10)
+            jobs = [
+                _make_mock_job(rule_name="myrule", jobid=1, **{resource: 2}),
+                _make_mock_job(rule_name="myrule", jobid=2, **{resource: 64}),
+            ]
+
+            executor.run_jobs(jobs)
+
+            calls = executor._job_submission_executor.submit.call_args_list
+            assert len(calls) == 2, f"{resource} did not split the batch"
+            assert all(call[0][0] == executor.run_job for call in calls)
+
+    def test_array_rule_keeps_jobs_with_equal_routing_resources_together(self):
+        """Splitting stays limited to jobs that actually differ."""
+        executor = _make_executor_stub(array_jobs="myrule", array_limit=10)
+        jobs = [
+            _make_mock_job(
+                rule_name="myrule", jobid=i, mpi_tasks=4, tasks_per_node=2, mem_mb=1000
+            )
+            for i in (1, 2, 3)
+        ]
+
+        executor.run_jobs(jobs)
+
+        calls = executor._job_submission_executor.submit.call_args_list
+        assert len(calls) == 1
+        assert calls[0][0][0] == executor.run_array_jobs
+        assert calls[0][0][1] == jobs
+
+    def test_array_rule_submits_a_full_chunk(self):
+        """A batch at chunk size goes out as one array submission."""
         executor = _make_executor_stub(array_jobs="myrule", array_limit=10)
         ready_jobs = [_make_mock_job(rule_name="myrule", jobid=i) for i in range(1, 11)]
         pending_jobs = [
@@ -297,6 +497,30 @@ class TestRunJobsRouting:
         assert len(calls) == 1
         assert calls[0][0][0] == executor.run_array_jobs
         assert calls[0][0][1] == ready_jobs
+
+    def test_a_throttled_rule_submits_every_job_over_several_rounds(self):
+        """A rule the scheduler feeds in batches gets all its jobs submitted.
+
+        Snakemake offers as many jobs as a resource allows, holds the rest,
+        and offers them again only when the running ones finish. 34 jobs at 16
+        per round, the case that stalled with the previous code.
+        """
+        executor = _make_executor_stub(array_jobs="myrule", array_limit=200)
+        all_jobs = [_make_mock_job(rule_name="myrule", jobid=i) for i in range(1, 35)]
+        executor.workflow.dag = SimpleNamespace(needrun_jobs=lambda: all_jobs)
+
+        submitted = []
+        for start in range(0, len(all_jobs), 16):
+            round_jobs = all_jobs[start : start + 16]
+            executor.run_jobs(round_jobs)
+            for call in executor._job_submission_executor.submit.call_args_list:
+                target, payload = call[0][0], call[0][1]
+                submitted.extend(
+                    payload if target == executor.run_array_jobs else [payload]
+                )
+            executor._job_submission_executor.submit.reset_mock()
+
+        assert submitted == all_jobs
 
 
 class TestRunJobErrorHandling:
@@ -366,6 +590,25 @@ class TestRunArrayJobs:
         for idx, c in enumerate(calls, start=1):
             job_info = c[0][0]
             assert job_info.aux["slurm_logfile"].name == f"987654_{idx}.log"
+
+    def test_logfile_per_task_sits_where_sbatch_writes_it(
+        self, tmp_path, mock_popen_success
+    ):
+        """The reported log path is the one sbatch --output names.
+
+        Error reports quote this path and successful logs are deleted through
+        it, so a path nobody writes to breaks both.
+        """
+        executor = self._build_executor(tmp_path)
+        jobs = self._make_jobs(n=2, rule_name="myrule")
+        jobs[0].wildcards = {"sample": "a"}
+        jobs[1].wildcards = {"sample": "b"}
+        executor.run_array_jobs(jobs)
+
+        call = mock_popen_success.call_args[0][0]
+        output_dir = Path(re.search(r"--output\s+'?([^'\s]+)", call).group(1)).parent
+        for c in executor._report_job_submission_threadsafe.call_args_list:
+            assert c[0][0].aux["slurm_logfile"].parent == output_dir
 
     def test_external_jobid_per_task_is_jobid_underscore_index(
         self, tmp_path, mock_popen_success
@@ -558,6 +801,29 @@ class TestRunArrayJobs:
 
         popen_call_str = mock_popen_success.call_args_list[0][0][0]
         assert "--exclude=bad_node01" in popen_call_str
+
+    def test_exception_after_a_chunk_does_not_fail_the_submitted_chunk(self, tmp_path):
+        """Tasks already registered stay registered when a later chunk raises."""
+        executor = self._build_executor(tmp_path, array_limit=2)
+        jobs = self._make_jobs(n=4)
+
+        proc = MagicMock()
+        proc.communicate.side_effect = [("987654", ""), RuntimeError("sbatch gone")]
+        proc.returncode = 0
+
+        with patch("snakemake_executor_plugin_slurm.subprocess.Popen") as popen:
+            popen.return_value = proc
+            executor.run_array_jobs(jobs)
+
+        submitted = [
+            c[0][0].job
+            for c in executor._report_job_submission_threadsafe.call_args_list
+        ]
+        failed = [
+            c[0][0].job for c in executor._report_job_error_threadsafe.call_args_list
+        ]
+        assert submitted == jobs[:2]
+        assert failed == jobs[2:]
 
 
 class TestStatusLookupIds:

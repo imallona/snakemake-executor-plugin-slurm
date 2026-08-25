@@ -124,9 +124,13 @@ def query_job_status_sacct(runid) -> list:
     # the more readable version ought to be re-adapted
 
     # -X: only show main job, no substeps
+    # JobID, not JobIdRaw: for an array task JobIdRaw is a separate number that
+    # never matches the '<array>_<task>' id the executor tracks, and the raw id
+    # of one task equals the array id, so every task resolves to that one task's
+    # state through the parent fallback.
     query_command = f"""sacct -X --parsable2 \
                         --clusters all \
-                        --noheader --format=JobIdRaw,State \
+                        --noheader --format=JobID,State \
                         --starttime {sacct_starttime} \
                         --endtime now --name {runid}"""
 

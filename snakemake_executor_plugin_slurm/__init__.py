@@ -44,7 +44,6 @@ from .accounts import (
 from .utils import (
     get_max_array_size,
     get_job_wildcards,
-    pending_jobs_for_rule,
     delete_slurm_environment,
     delete_empty_dirs,
     set_gres_string,
@@ -448,6 +447,45 @@ def _select_logdir(workflow):
         return Path(".snakemake/slurm_logs").resolve()
 
 
+# Resources that steer which account and partition a job resolves to.
+# The rendered command covers most of them, but not all: `mpi_tasks` never
+# reaches the sbatch call, and `tasks_per_node` reaches it only for MPI jobs,
+# while partition auto-selection scores a job on both. Reading them here
+# instead of trusting the command keeps the signature honest. Splitting on a
+# resource that turns out not to matter costs a smaller array; missing one
+# submits a task under another job's account or partition.
+_ROUTING_RESOURCES = (
+    "slurm_account",
+    "slurm_partition",
+    "slurm_cluster",
+    "cluster",
+    "clusters",
+    "mem_mb",
+    "mem_mb_per_cpu",
+    "runtime",
+    "nodes",
+    "tasks",
+    "tasks_per_node",
+    "mpi_tasks",
+    "mpi",
+    "gpu",
+    "gpu_model",
+    "gres",
+)
+
+# Placeholders for the parts of an sbatch call that say which job it is rather
+# than what it asks for. Held constant so a signature compares resources only.
+# _submission_signature compares the routing resources separately.
+_SIGNATURE_PARAMS = {
+    "run_uuid": "",
+    "slurm_logfile": "",
+    "comment_str": "",
+    "account": "",
+    "partition": "",
+    "workdir": "",
+}
+
+
 # Required:
 # Implementation of your executor
 class Executor(RemoteExecutor):
@@ -690,62 +728,39 @@ class Executor(RemoteExecutor):
                     )
                 self._submit_job(job)
             else:
-                ready_jobs_by_rule.setdefault(job.rule.name, []).append(job)
+                rule_name = job.rule.name
+                # Only an array submission makes its tasks share one set of
+                # sbatch options, so only it needs the signature that keeps
+                # mismatched jobs out of the same submission. Rendering one
+                # per job on every dispatch is wasted work otherwise.
+                if self._array_selected(rule_name):
+                    key = (rule_name, self._submission_signature(job))
+                else:
+                    key = (rule_name, None)
+                ready_jobs_by_rule.setdefault(key, []).append(job)
 
-        for rule_name, same_rule_jobs in ready_jobs_by_rule.items():
-            array_selected_for_rule = (
-                "all" in self.array_jobs or rule_name in self.array_jobs
-            )
+        for (rule_name, _signature), same_rule_jobs in ready_jobs_by_rule.items():
+            array_selected_for_rule = self._array_selected(rule_name)
             # TODO: use more sensible logging information, once finished
             self.logger.debug(f"Running jobs for rule: {rule_name}, {same_rule_jobs}")
             self.logger.debug(f"Current array job settings: {self.array_jobs}")
 
             if array_selected_for_rule:
-                dag = getattr(self.workflow, "dag", None)
-                if dag is not None:
-                    eligible_jobs = pending_jobs_for_rule(dag, rule_name)
-                else:
-                    eligible_jobs = len(same_rule_jobs)
-                    self.logger.debug(
-                        "workflow.dag unavailable in run_jobs(); "
-                        "falling back to ready-job count for eligibility "
-                        f"({rule_name}: {eligible_jobs})."
-                    )
-
-                # Keep synchronization against DAG eligibility, but do not block
-                # once at least one full array chunk is ready.
-                chunk_size = self.max_array_size
-
+                # The scheduler counts a job as running once it hands it
+                # over and never offers it again, so a job held back to fill
+                # a larger array is never submitted. Submit whatever arrived.
                 if len(same_rule_jobs) == 1:
-                    if eligible_jobs <= 1:
-                        self.logger.debug(
-                            f"Array submission requested for rule {rule_name}, "
-                            "but only one pending job is available; submitting "
-                            "as a regular job."
-                        )
-                        self._submit_job(same_rule_jobs[0])
-                    else:
-                        self.logger.debug(
-                            "Array job collection incomplete for rule "
-                            f"{rule_name}: 1/{eligible_jobs} arrived. Waiting "
-                            "for at least one full chunk."
-                        )
-                else:
-                    if (
-                        len(same_rule_jobs) < eligible_jobs
-                        and len(same_rule_jobs) < chunk_size
-                    ):
-                        self.logger.debug(
-                            "Array job collection incomplete for rule "
-                            f"{rule_name}: {len(same_rule_jobs)}/{eligible_jobs} "
-                            "arrived (< chunk size), waiting for more jobs."
-                        )
-                        continue
-
                     self.logger.debug(
-                        "Submitting array-selected jobs for rule "
-                        f"{rule_name}: {len(same_rule_jobs)} ready, "
-                        f"{eligible_jobs} eligible, chunk_size={chunk_size}."
+                        f"Array submission requested for rule {rule_name}, "
+                        "but only one job is ready; submitting it as a "
+                        "regular job."
+                    )
+                    self._submit_job(same_rule_jobs[0])
+                else:
+                    self.logger.debug(
+                        f"Submitting {len(same_rule_jobs)} ready jobs for rule "
+                        f"{rule_name} as an array, chunked at "
+                        f"{self.max_array_size}."
                     )
                     self._submit_array_jobs(same_rule_jobs)
                 continue
@@ -764,6 +779,42 @@ class Executor(RemoteExecutor):
                 )
                 for job in same_rule_jobs:
                     self._submit_job(job)
+
+    def _array_selected(self, rule_name: str) -> bool:
+        """Whether jobs of this rule are to be submitted as an array."""
+        return "all" in self.array_jobs or rule_name in self.array_jobs
+
+    def _submission_signature(self, job: JobExecutorInterface) -> tuple:
+        """The sbatch options this job needs, as a hashable key.
+
+        One array submission carries the options of its first task, so only
+        jobs whose options match may share it.
+
+        Account and partition enter as the requested resources, not as
+        resolved sbatch arguments: resolving validates the account against the
+        cluster and may run partition auto-selection, too slow to repeat for
+        every job on every dispatch. Resolution is deterministic given the
+        request and the resources that auto-selection scores, so the signature
+        reads those directly rather than trusting the command to show them
+        all - see _ROUTING_RESOURCES.
+        """
+        routing = tuple(
+            None if value is None else str(value)
+            for value in (job.resources.get(key) for key in _ROUTING_RESOURCES)
+        )
+        try:
+            command = get_submit_command(
+                job,
+                dict(_SIGNATURE_PARAMS),
+                settings=self.workflow.executor_settings,
+                failed_nodes=self._failed_nodes,
+            ) + set_gres_string(job)
+        except Exception as e:
+            # A job whose command cannot be rendered groups by rule and
+            # routing alone.
+            self.logger.debug(f"Cannot build a submission signature: {e}")
+            command = ""
+        return (command,) + routing
 
     def _submit_job(self, job: JobExecutorInterface):
         """Emit standard job metadata before submitting one Slurm job."""
@@ -796,6 +847,10 @@ class Executor(RemoteExecutor):
             self.report_job_error(job_info, msg=msg)
 
     def run_array_jobs(self, jobs: List[JobExecutorInterface]):
+        # Jobs already handed back to Snakemake, as submitted or as failed.
+        # The handler at the end must not report those a second time: a chunk
+        # that raises comes after chunks that are already running.
+        reported = set()
         try:
             self.logger.debug(
                 f"Preparing to submit array job for rule {jobs[0].rule.name} "
@@ -978,6 +1033,7 @@ class Executor(RemoteExecutor):
                         )
                         self.logger.error(error_msg)
                         for job in jobs[start_index - 1 : end_index]:
+                            reported.add(id(job))
                             self._report_job_error_threadsafe(
                                 SubmittedJobInfo(job),
                                 (
@@ -1006,12 +1062,11 @@ class Executor(RemoteExecutor):
                     # Calculate the actual logfile path for this array task
                     job = jobs[index - 1]
                     job_ids.append(job.jobid)
-                    job_wildcard_str = get_job_wildcards(job)
+                    # sbatch was given <logdir>/<rule>/%A_%a.log above, and
+                    # it is the only writer, so the wildcards of the task play
+                    # no part in the path.
                     job_logfile = (
-                        self.slurm_logdir
-                        / group_or_rule
-                        / job_wildcard_str
-                        / f"{slurm_jobid}_{index}.log"
+                        self.slurm_logdir / group_or_rule / f"{slurm_jobid}_{index}.log"
                     )
 
                     job_info = SubmittedJobInfo(
@@ -1019,6 +1074,7 @@ class Executor(RemoteExecutor):
                         external_jobid=f"{slurm_jobid}_{index}",
                         aux={"slurm_logfile": job_logfile},
                     )
+                    reported.add(id(job))
                     self._report_job_submission_threadsafe(job_info)
                     self.logger.debug(
                         f"Registered array job task: "
@@ -1047,6 +1103,8 @@ class Executor(RemoteExecutor):
                 exc_info=True,
             )
             for job in jobs:
+                if id(job) in reported:
+                    continue
                 self._report_job_error_threadsafe(
                     SubmittedJobInfo(job),
                     f"Array job submission failed with exception: {e}",

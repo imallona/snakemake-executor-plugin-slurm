@@ -1,6 +1,5 @@
 # utility functions for the SLURM executor plugin
 
-from collections import Counter
 import math
 import os
 import shlex
@@ -9,7 +8,6 @@ import re
 from pathlib import Path
 from typing import Union
 
-from snakemake_interface_executor_plugins.dag import DAGExecutorInterface
 from snakemake_interface_executor_plugins.jobs import (
     JobExecutorInterface,
 )
@@ -69,38 +67,6 @@ def get_job_wildcards(job: JobExecutorInterface) -> str:
         wildcard_str = ""
 
     return wildcard_str
-
-
-def pending_jobs_for_rule(dag: DAGExecutorInterface, rule_name: str) -> int:
-    """Count jobs of a rule that are currently eligible for scheduling.
-
-    Prefer DAG ``ready_jobs`` if available because it reflects jobs that can
-    run now. Fall back to ``needrun_jobs`` for compatibility with interfaces
-    that do not expose ready jobs.
-    """
-    # Previous implementation (kept as requested for reference):
-    # counts = Counter(job.rule.name for job in dag.needrun_jobs())
-    # return counts.get(rule_name, 0)
-
-    jobs = None
-
-    ready_jobs_attr = getattr(dag, "ready_jobs", None)
-    if callable(ready_jobs_attr):
-        jobs = ready_jobs_attr()
-    elif ready_jobs_attr is not None:
-        jobs = ready_jobs_attr
-
-    if jobs is None:
-        needrun_jobs_attr = getattr(dag, "needrun_jobs", None)
-        if callable(needrun_jobs_attr):
-            jobs = needrun_jobs_attr()
-        elif needrun_jobs_attr is not None:
-            jobs = needrun_jobs_attr
-        else:
-            jobs = []
-
-    counts = Counter(job.rule.name for job in jobs)
-    return counts.get(rule_name, 0)
 
 
 def round_half_up(n):
