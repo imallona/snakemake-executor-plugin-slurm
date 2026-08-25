@@ -447,9 +447,6 @@ def _select_logdir(workflow):
         return Path(".snakemake/slurm_logs").resolve()
 
 
-# Placeholders for the parts of an sbatch call that say which job it is rather
-# than what it asks for. Held constant so a signature compares resources only.
-# _submission_signature compares account and partition separately.
 # Resources that steer which account and partition a job resolves to.
 # The rendered command covers most of them, but not all: `mpi_tasks` never
 # reaches the sbatch call, and `tasks_per_node` reaches it only for MPI jobs,
@@ -476,6 +473,9 @@ _ROUTING_RESOURCES = (
     "gres",
 )
 
+# Placeholders for the parts of an sbatch call that say which job it is rather
+# than what it asks for. Held constant so a signature compares resources only.
+# _submission_signature compares the routing resources separately.
 _SIGNATURE_PARAMS = {
     "run_uuid": "",
     "slurm_logfile": "",
